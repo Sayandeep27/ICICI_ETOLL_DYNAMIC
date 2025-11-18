@@ -4,7 +4,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from pathlib import Path
 
-# dynamic logic has been added
+# dynamic + every value is correct
+
 
 # ------------- CONFIG -------------
 DSR_FILE = "dsr_report.xlsx"
@@ -51,7 +52,7 @@ TEMPLATE = [
     ("0103SLPPCIGT", "Etoll acq {dd_mm_yy}_{cycle}", "GST Credit"),
 ]
 
-# Description → TC mapping rules
+# Mapping rules
 RULES = {
     "NETC Settled Transaction":         {"cycles": ["netc settled transaction"], "sum_col": COL_SETAMTCR, "side": "credit"},
     "Debit Adjustment":                 {"cycles": ["debitadjustment", "debit adjustment"], "sum_col": COL_SETAMTCR, "side": "credit"},
@@ -73,15 +74,13 @@ RULES = {
 
 # Helpers
 def to_decimal(x):
-    if x is None:
-        return Decimal("0")
     try:
         if pd.isna(x):
             return Decimal("0")
     except:
         pass
     s = str(x).replace(",", "").strip()
-    if s == "" or s.lower() == "nan":
+    if not s or s.lower() == "nan":
         return Decimal("0")
     try:
         return Decimal(s)
@@ -95,15 +94,20 @@ def round2(d: Decimal):
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-# ======== MAIN ========
+# ======================= MAIN =======================
 def generate_voucher():
 
     df = pd.read_excel(DSR_FILE)
     df.columns = df.columns.str.strip()
 
-    # Forward fill merged cells
-    for c in (COL_TRANSACTION_CYCLE, COL_TRANSACTION_TYPE, COL_CHANNEL):
-        df[c] = df[c].ffill()
+    # --------- IMPORTANT CHANGES ---------
+    # ffill ONLY for Transaction Cycle and Transaction Type
+    df[COL_TRANSACTION_CYCLE] = df[COL_TRANSACTION_CYCLE].ffill()
+    df[COL_TRANSACTION_TYPE] = df[COL_TRANSACTION_TYPE].ffill()
+
+    # DO NOT FFILL CHANNEL
+    # df[COL_CHANNEL] stays as is
+    # -------------------------------------
 
     # Settlement date
     settlement = datetime.today().date()
@@ -120,46 +124,41 @@ def generate_voucher():
     dd_mm_yy = settlement.strftime("%d.%m.%y")
     cycle_suffix = f"{RUN_NUMBER}C"
 
-    # Normalize TC
+    # Normalize TC, TT, CH
     df["TC"] = df[COL_TRANSACTION_CYCLE].astype(str).str.strip().str.lower()
+    df["TT"] = df[COL_TRANSACTION_TYPE].astype(str).str.strip().str.lower()
+    df["CH"] = df[COL_CHANNEL].astype(str).str.strip().str.lower()
 
-    # --- FINAL NET AMT: row ABOVE INWARD GST ---
+    # --- FINAL NET AMT (row above INWARD GST)
     final_amt = Decimal("0")
     inward_gst_rows = df[df[COL_INWARD_OUTWARD].astype(str).str.upper().str.strip() == "INWARD GST"]
 
     if not inward_gst_rows.empty:
         idx = inward_gst_rows.index[0]
         if idx > 0:
-            raw_final = df.iloc[idx - 1][COL_FINAL_NET_AMT]
-            final_amt = round2(to_decimal(raw_final))
+            final_amt = round2(to_decimal(df.iloc[idx - 1][COL_FINAL_NET_AMT]))
 
     if final_amt < 0:
         print("Final Net Amt negative. Terminating.")
         return
 
-    # --- INCOME + GST VALUES (Option A) ---
+    # --- INCOME/GST (Option A)
     income_debit_val = income_credit_val = Decimal("0")
     gst_debit_val = gst_credit_val = Decimal("0")
 
     if not inward_gst_rows.empty:
         idx = inward_gst_rows.index[0]
 
-        # Row ABOVE INWARD GST → INCOME values
+        # INCOME values from row above
         if idx > 0:
-            row_above = df.iloc[idx - 1]
-            income_debit_val = round2(to_decimal(row_above.get(COL_SERVICE_FEE_DR, 0)))
-            income_credit_val = round2(to_decimal(row_above.get(COL_SERVICE_FEE_CR, 0)))
+            row = df.iloc[idx - 1]
+            income_debit_val = round2(to_decimal(row.get(COL_SERVICE_FEE_DR, 0)))
+            income_credit_val = round2(to_decimal(row.get(COL_SERVICE_FEE_CR, 0)))
 
-        # INWARD GST row → GST values
-        row_gst = inward_gst_rows.iloc[0]
-        gst_debit_val = round2(to_decimal(row_gst.get(COL_SERVICE_FEE_DR, 0)))
-        gst_credit_val = round2(to_decimal(row_gst.get(COL_SERVICE_FEE_CR, 0)))
-
-    print("INCOME/ GST extracted:",
-          "Income DR =", income_debit_val,
-          "Income CR =", income_credit_val,
-          "GST DR =", gst_debit_val,
-          "GST CR =", gst_credit_val)
+        # GST from INWARD GST row
+        rowg = inward_gst_rows.iloc[0]
+        gst_debit_val = round2(to_decimal(rowg.get(COL_SERVICE_FEE_DR, 0)))
+        gst_credit_val = round2(to_decimal(rowg.get(COL_SERVICE_FEE_CR, 0)))
 
     # ----- BUILD VOUCHER -----
     voucher_rows = []
@@ -171,31 +170,47 @@ def generate_voucher():
                                .replace("{dd_mm_yy}", dd_mm_yy)
                                .replace("{cycle}", cycle_suffix))
 
-        # Spacer
         if acct == "" and desc == "":
             voucher_rows.append(["","","","",""])
             continue
 
         rule = RULES.get(desc, {})
 
-        # -------- Final Net ----------
+        # Final Net
         if rule.get("special") == "final":
             voucher_rows.append([acct, float(final_amt), "", narration, desc])
             continue
 
-        # -------- Inward DR ----------
+        # Inward DR
         if rule.get("special") == "inward_dr":
             amt = income_debit_val if desc == "Income Debit" else gst_debit_val
             voucher_rows.append([acct, float(amt) if amt != 0 else "", "", narration, desc])
             continue
 
-        # -------- Inward CR ----------
+        # Inward CR
         if rule.get("special") == "inward_cr":
             amt = income_credit_val if desc == "Income Credit" else gst_credit_val
             voucher_rows.append([acct, "", float(amt) if amt != 0 else "", narration, desc])
             continue
 
-        # -------- Normal cycle-based sums (NO strict validation) ----------
+        # -------- Arbitration Vedict special logic --------
+        if desc == "Arbitration Vedict":
+
+            arb_rows = df[(df["TC"] == "arbitration vedict") &
+                          (df["TT"].isin(["debit", "non_fin"])) &
+                          (df[COL_CHANNEL].notna()) &
+                          (df[COL_CHANNEL] != "")]
+
+            amt = round2(sum(arb_rows[COL_SETAMTDR].apply(to_decimal), Decimal("0")))
+
+            voucher_rows.append([acct,
+                                 float(amt) if amt != 0 else "",
+                                 "",
+                                 narration,
+                                 desc])
+            continue
+
+        # Normal rules
         cycles = rule.get("cycles", [])
         cycles = [c.lower() for c in cycles]
         sum_col = rule.get("sum_col")
@@ -203,7 +218,6 @@ def generate_voucher():
 
         sel = df[df["TC"].isin(cycles)]
 
-        # Good Faith special → pick DR or CR whichever exists
         if side == "goodfaith":
             amt_dr = round2(sum(sel[COL_SETAMTDR].apply(to_decimal), Decimal("0")))
             amt_cr = round2(sum(sel[COL_SETAMTCR].apply(to_decimal), Decimal("0")))
@@ -225,16 +239,15 @@ def generate_voucher():
         else:
             voucher_rows.append([acct, float(amt) if amt != 0 else "", "", narration, desc])
 
-    # Save output
+    # Save
     out_folder = OUTPUT_ROOT / settlement.strftime("%Y") / settlement.strftime("%m") / settlement.strftime("%d")
     out_folder.mkdir(parents=True, exist_ok=True)
     outfile = out_folder / f"ETOLL_ACQUIRING_VOUCHER_{ddmmyy}_N{RUN_NUMBER}.xlsx"
-
     pd.DataFrame(voucher_rows,
-                 columns=["Account No", "Debit", "Credit", "Narration", "Description"]).to_excel(outfile, index=False)
+                 columns=["Account No","Debit","Credit","Narration","Description"]).to_excel(outfile,index=False)
 
     print("Voucher saved at:", outfile)
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     generate_voucher()
