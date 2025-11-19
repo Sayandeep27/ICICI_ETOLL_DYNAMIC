@@ -4,8 +4,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from pathlib import Path
 
-# 100% working
-# dynamic + every value is correct
+
+# voucher and upload sheet is being generated from DSR report
 
 
 # ------------- CONFIG -------------
@@ -13,7 +13,7 @@ DSR_FILE = "dsr_report.xlsx"
 RUN_NUMBER = 1
 OUTPUT_ROOT = Path("E-tollAcquiringSettlement/Processing")
 
-# Column names
+# Column names (must match Excel)
 COL_SETTLEMENT_DATE = "Settlement Date"
 COL_TRANSACTION_CYCLE = "Transaction Cycle"
 COL_TRANSACTION_TYPE = "Transaction Type"
@@ -25,7 +25,7 @@ COL_SERVICE_FEE_CR = "Service Fee Amt Cr"
 COL_FINAL_NET_AMT = "Final Net Amt"
 COL_INWARD_OUTWARD = "Inward/Outward"
 
-# Template (unchanged)
+# TEMPLATE (unchanged)
 TEMPLATE = [
     ("0103SLRGTSRC", "NPCIR5{yyyymmdd} {ddmmyy}_{cycle} ETCAC", "Final Net Amt"),
     ("", "", ""),
@@ -53,7 +53,7 @@ TEMPLATE = [
     ("0103SLPPCIGT", "Etoll acq {dd_mm_yy}_{cycle}", "GST Credit"),
 ]
 
-# Mapping rules
+# RULES (unchanged)
 RULES = {
     "NETC Settled Transaction":         {"cycles": ["netc settled transaction"], "sum_col": COL_SETAMTCR, "side": "credit"},
     "Debit Adjustment":                 {"cycles": ["debitadjustment", "debit adjustment"], "sum_col": COL_SETAMTCR, "side": "credit"},
@@ -73,7 +73,7 @@ RULES = {
     "Final Net Amt":                    {"special": "final"},
 }
 
-# Helpers
+# ---------------- helpers ----------------
 def to_decimal(x):
     try:
         if pd.isna(x):
@@ -81,7 +81,7 @@ def to_decimal(x):
     except:
         pass
     s = str(x).replace(",", "").strip()
-    if not s or s.lower() == "nan":
+    if s == "" or s.lower() == "nan":
         return Decimal("0")
     try:
         return Decimal(s)
@@ -91,119 +91,149 @@ def to_decimal(x):
         except:
             return Decimal("0")
 
-def round2(d: Decimal):
+def round2(d):
+    # Accept Decimal, int, float — convert to Decimal before quantize
+    if not isinstance(d, Decimal):
+        try:
+            d = Decimal(str(d))
+        except:
+            d = Decimal("0")
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-# ======================= MAIN =======================
+# ---------------- MAIN ----------------
 def generate_voucher():
-
-    df = pd.read_excel(DSR_FILE)
-    df.columns = df.columns.str.strip()
-
-    # ffill only TC & TT
-    df[COL_TRANSACTION_CYCLE] = df[COL_TRANSACTION_CYCLE].ffill()
-    df[COL_TRANSACTION_TYPE] = df[COL_TRANSACTION_TYPE].ffill()
-
-    # DO NOT ffill CHANNEL
-    df["TC"] = df[COL_TRANSACTION_CYCLE].astype(str).str.strip().str.lower()
-    df["TT"] = df[COL_TRANSACTION_TYPE].astype(str).str.strip().str.lower()
-    df["CH"] = df[COL_CHANNEL].astype(str).str.strip().str.lower()
-
-    # ===================================================
-    # NEW FINAL NET AMOUNT LOGIC (RIGHTMOST + LOWEST)
-    # ===================================================
-    if df[COL_FINAL_NET_AMT].notna().sum() > 0:
-        final_raw = df[COL_FINAL_NET_AMT].dropna().iloc[-1]
-        final_amt = round2(to_decimal(final_raw))
-    else:
-        final_amt = Decimal("0.00")
-    # ===================================================
-
-    if final_amt < 0:
-        print("Final Net Amt negative. Terminating.")
+    p = Path(DSR_FILE)
+    if not p.exists():
+        print("DSR not found:", p.resolve())
         return
 
-    # Settlement date
+    df = pd.read_excel(p)
+    df.columns = df.columns.str.strip()
+
+    # --------- IMPORTANT: only ffill TC and TT (NOT Channel) ---------
+    if COL_TRANSACTION_CYCLE in df.columns:
+        df[COL_TRANSACTION_CYCLE] = df[COL_TRANSACTION_CYCLE].ffill()
+    if COL_TRANSACTION_TYPE in df.columns:
+        df[COL_TRANSACTION_TYPE] = df[COL_TRANSACTION_TYPE].ffill()
+    # DO NOT ffill Channel
+
+    # settlement date (first non-empty)
     settlement = datetime.today().date()
-    for v in df[COL_SETTLEMENT_DATE].astype(str):
-        if v.strip() and v.strip().lower() != "nan":
-            try:
-                settlement = datetime.strptime(v.strip(), "%d-%m-%Y").date()
-            except:
-                pass
-            break
+    if COL_SETTLEMENT_DATE in df.columns:
+        for v in df[COL_SETTLEMENT_DATE].astype(str):
+            if v.strip() and v.strip().lower() != "nan":
+                try:
+                    settlement = datetime.strptime(v.strip(), "%d-%m-%Y").date()
+                except:
+                    pass
+                break
 
     yyyymmdd = settlement.strftime("%Y%m%d")
     ddmmyy = settlement.strftime("%d%m%y")
     dd_mm_yy = settlement.strftime("%d.%m.%y")
-    cycle_suffix = f"{RUN_NUMBER}C"
+    cycle = f"{RUN_NUMBER}C"
 
-    # ------ INWARD / GST --------
-    income_debit_val = income_credit_val = Decimal("0")
-    gst_debit_val = gst_credit_val = Decimal("0")
+    # normalized helper columns
+    df["TC"] = df[COL_TRANSACTION_CYCLE].astype(str).str.strip().str.lower()
+    df["TT"] = df[COL_TRANSACTION_TYPE].astype(str).str.strip().str.lower()
+    df["CH"] = df[COL_CHANNEL].astype(str).str.strip().str.lower()
 
-    inward_gst_rows = df[df[COL_INWARD_OUTWARD].astype(str).str.upper().str.strip() == "INWARD GST"]
+    # ---------- FINAL NET AMT: RIGHTMOST + LOWEST non-empty cell in the Final Net Amt column ----------
+    total_final = Decimal("0.00")
+    if COL_FINAL_NET_AMT in df.columns:
+        # take last non-empty value
+        series = df[COL_FINAL_NET_AMT].dropna().astype(str).map(lambda x: x.strip())
+        series = series[series != ""]
+        if not series.empty:
+            raw = series.iloc[-1]
+            total_final = round2(to_decimal(raw))
+    else:
+        total_final = Decimal("0.00")
 
-    if not inward_gst_rows.empty:
-        idx = inward_gst_rows.index[0]
+    print("Final Net Amt (Rightmost+Lowest) =", total_final)
 
-        if idx > 0:
-            r = df.iloc[idx - 1]
-            income_debit_val = round2(to_decimal(r.get(COL_SERVICE_FEE_DR, 0)))
-            income_credit_val = round2(to_decimal(r.get(COL_SERVICE_FEE_CR, 0)))
+    if total_final < 0:
+        print("Final Net Amt negative:", total_final, "Terminating.")
+        return
 
-        g = inward_gst_rows.iloc[0]
-        gst_debit_val = round2(to_decimal(g.get(COL_SERVICE_FEE_DR, 0)))
-        gst_credit_val = round2(to_decimal(g.get(COL_SERVICE_FEE_CR, 0)))
+    # ---------- INWARD / INWARD GST (Option A: row above INWARD GST = INCOME; INWARD GST row = GST) ----------
+    income_debit = income_credit = gst_debit = gst_credit = Decimal("0")
+    if COL_INWARD_OUTWARD in df.columns:
+        cond_gst = df[COL_INWARD_OUTWARD].astype(str).str.upper().str.strip() == "INWARD GST"
+        inward_gst_rows = df[cond_gst]
+        if not inward_gst_rows.empty:
+            idx_gst = inward_gst_rows.index[0]
+            # row above => income values
+            if idx_gst > 0:
+                row_above = df.iloc[idx_gst - 1]
+                income_debit = round2(to_decimal(row_above.get(COL_SERVICE_FEE_DR, 0)))
+                income_credit = round2(to_decimal(row_above.get(COL_SERVICE_FEE_CR, 0)))
+            # GST row => gst values
+            row_gst = inward_gst_rows.iloc[0]
+            gst_debit = round2(to_decimal(row_gst.get(COL_SERVICE_FEE_DR, 0)))
+            gst_credit = round2(to_decimal(row_gst.get(COL_SERVICE_FEE_CR, 0)))
 
-    # ----------------------
-    # BUILD VOUCHER
-    # ----------------------
-    voucher_rows = []
+    print("Derived INWARD values -> Income Debit: {}, GST Debit: {}, Income Credit: {}, GST Credit: {}".format(
+        income_debit, gst_debit, income_credit, gst_credit
+    ))
 
-    for acct, narr_tmpl, desc in TEMPLATE:
+    # ---------------- BUILD VOUCHER ----------------
+    voucher = []
 
-        narration = (narr_tmpl.replace("{yyyymmdd}", yyyymmdd)
-                                 .replace("{ddmmyy}", ddmmyy)
-                                 .replace("{dd_mm_yy}", dd_mm_yy)
-                                 .replace("{cycle}", cycle_suffix))
+    for acct, tmpl, desc in TEMPLATE:
+        narration = tmpl.replace("{yyyymmdd}", yyyymmdd)\
+                        .replace("{ddmmyy}", ddmmyy)\
+                        .replace("{dd_mm_yy}", dd_mm_yy)\
+                        .replace("{cycle}", cycle)
 
+        # spacer
         if acct == "" and desc == "":
-            voucher_rows.append(["","","","",""])
+            voucher.append(["", "", "", "", ""])
             continue
 
         rule = RULES.get(desc, {})
 
-        # Final Net Amt
+        # final net
         if rule.get("special") == "final":
-            voucher_rows.append([acct, float(final_amt), "", narration, desc])
+            voucher.append([acct, float(total_final) if total_final != Decimal("0.00") else "", "", narration, desc])
             continue
 
-        # Income / GST debit
+        # inward dr
         if rule.get("special") == "inward_dr":
-            amt = income_debit_val if desc == "Income Debit" else gst_debit_val
-            voucher_rows.append([acct, float(amt) if amt != 0 else "", "", narration, desc])
+            if desc == "Income Debit":
+                voucher.append([acct, float(income_debit) if income_debit != Decimal("0.00") else "", "", narration, desc])
+            elif desc == "GST Debit":
+                voucher.append([acct, float(gst_debit) if gst_debit != Decimal("0.00") else "", "", narration, desc])
+            else:
+                voucher.append([acct, "", "", narration, desc])
             continue
 
-        # Income / GST credit
+        # inward cr
         if rule.get("special") == "inward_cr":
-            amt = income_credit_val if desc == "Income Credit" else gst_credit_val
-            voucher_rows.append([acct, "", float(amt) if amt != 0 else "", narration, desc])
+            if desc == "Income Credit":
+                voucher.append([acct, "", float(income_credit) if income_credit != Decimal("0.00") else "", narration, desc])
+            elif desc == "GST Credit":
+                voucher.append([acct, "", float(gst_credit) if gst_credit != Decimal("0.00") else "", narration, desc])
+            else:
+                voucher.append([acct, "", "", narration, desc])
             continue
 
-        # Arbitration Vedict rules unchanged
+        # Arbitration Vedict special: sum SETAMTDR where TC=arbitration vedict, TT in {debit, non_fin} and Channel present (no ffill on channel)
         if desc == "Arbitration Vedict":
-            arb_rows = df[(df["TC"] == "arbitration vedict") &
-                          (df["TT"].isin(["debit", "non_fin"])) &
-                          (df[COL_CHANNEL].notna()) &
-                          (df[COL_CHANNEL] != "")]
-            amt = round2(sum(arb_rows[COL_SETAMTDR].apply(to_decimal), Decimal("0")))
-            voucher_rows.append([acct, float(amt) if amt != 0 else "", "", narration, desc])
+            arb_sel = df[
+                (df["TC"] == "arbitration vedict") &
+                (df["TT"].isin(["debit", "non_fin"])) &
+                (df[COL_CHANNEL].notna()) &
+                (df[COL_CHANNEL].astype(str).str.strip() != "")
+            ]
+            arb_amt = round2(sum(arb_sel[COL_SETAMTDR].apply(to_decimal), Decimal("0")))
+            voucher.append([acct, float(arb_amt) if arb_amt != Decimal("0.00") else "", "", narration, desc])
+            print("Arbitration Vedict: summed SETAMTDR = {} (rows counted: {})".format(arb_amt, len(arb_sel)))
             continue
 
-        # All other rules unchanged
-        cycles = [c.lower() for c in rule.get("cycles", [])]
+        # Normal aggregation (no strict validation — use TC only)
+        cycles = [c.lower() for c in rule.get("cycles", [])] if rule.get("cycles") else []
         sum_col = rule.get("sum_col")
         side = rule.get("side")
 
@@ -212,32 +242,102 @@ def generate_voucher():
         if side == "goodfaith":
             amt_dr = round2(sum(sel[COL_SETAMTDR].apply(to_decimal), Decimal("0")))
             amt_cr = round2(sum(sel[COL_SETAMTCR].apply(to_decimal), Decimal("0")))
-
-            if amt_dr != 0:
-                voucher_rows.append([acct, float(amt_dr), "", narration, desc])
-            elif amt_cr != 0:
-                voucher_rows.append([acct, "", float(amt_cr), narration, desc])
+            if amt_dr != Decimal("0.00"):
+                voucher.append([acct, float(amt_dr), "", narration, desc])
+            elif amt_cr != Decimal("0.00"):
+                voucher.append([acct, "", float(amt_cr), narration, desc])
             else:
-                voucher_rows.append([acct, "", "", narration, desc])
+                voucher.append([acct, "", "", narration, desc])
             continue
 
-        amt = Decimal("0")
+        amt = Decimal("0.00")
         if sum_col:
             amt = round2(sum(sel[sum_col].apply(to_decimal), Decimal("0")))
 
         if side == "credit":
-            voucher_rows.append([acct, "", float(amt) if amt != 0 else "", narration, desc])
+            voucher.append([acct, "", float(amt) if amt != Decimal("0.00") else "", narration, desc])
         else:
-            voucher_rows.append([acct, float(amt) if amt != 0 else "", "", narration, desc])
+            voucher.append([acct, float(amt) if amt != Decimal("0.00") else "", "", narration, desc])
 
-    # Save
+        print(f"{desc}: summed {sum_col} = {amt} (rows counted: {len(sel)})")
+
+    # Prepare voucher DataFrame
+    voucher_df = pd.DataFrame(voucher, columns=["Account No", "Debit", "Credit", "Narration", "Description"])
+
+    # ---------------- CREATE UPLOAD SHEET ----------------
+    # Copy Account No, Debit, Credit, Narration into Upload sheet (values only)
+    upload_df = voucher_df[["Account No", "Debit", "Credit", "Narration"]].copy()
+
+    # Insert C/D column before Debit (i.e. new column named 'C/D' goes at index 1)
+    # C/D logic: if Debit not null and >0 => 'D', elif Credit not null and >0 => 'C', else blank
+    def cd_flag(row):
+        try:
+            d = to_decimal(row["Debit"])
+        except:
+            d = Decimal("0")
+        try:
+            c = to_decimal(row["Credit"])
+        except:
+            c = Decimal("0")
+        if d != Decimal("0"):
+            return "D"
+        if c != Decimal("0"):
+            return "C"
+        return ""
+
+    upload_df.insert(1, "C/D", upload_df.apply(cd_flag, axis=1))
+
+    # Amount column: if Debit present use Debit else use Credit (Option 1 -> keep positive)
+    def amount_val(row):
+        d = to_decimal(row["Debit"])
+        if d != Decimal("0"):
+            return float(d)
+        c = to_decimal(row["Credit"])
+        if c != Decimal("0"):
+            return float(c)
+        return ""
+
+    upload_df["Amount"] = upload_df.apply(amount_val, axis=1)
+
+    # Drop original Credit column as instruction says remove Column D named Credit later
+    upload_df = upload_df[["Account No", "C/D", "Amount", "Narration"]]
+
+    # Remove rows where Amount is zero/blank
+    upload_df = upload_df[upload_df["Amount"].apply(lambda x: x != "" and x is not None and float(x) != 0)]
+
+    # Reset index for neatness
+    upload_df = upload_df.reset_index(drop=True)
+
+    # ---------------- VALIDATE TALLY: Voucher Debit total == Voucher Credit total ----------------
+    voucher_debit_total = sum(voucher_df["Debit"].apply(lambda x: to_decimal(x)))
+    voucher_credit_total = sum(voucher_df["Credit"].apply(lambda x: to_decimal(x)))
+
+    voucher_debit_total = round2(voucher_debit_total)
+    voucher_credit_total = round2(voucher_credit_total)
+
+    print("Voucher totals -> Debit:", voucher_debit_total, "Credit:", voucher_credit_total)
+
     out_folder = OUTPUT_ROOT / settlement.strftime("%Y") / settlement.strftime("%m") / settlement.strftime("%d")
     out_folder.mkdir(parents=True, exist_ok=True)
-    outfile = out_folder / f"ETOLL_ACQUIRING_VOUCHER_{ddmmyy}_N{RUN_NUMBER}.xlsx"
-    pd.DataFrame(voucher_rows,
-                 columns=["Account No","Debit","Credit","Narration","Description"]).to_excel(outfile,index=False)
 
-    print("Voucher saved at:", outfile)
+    outfile = out_folder / f"ETOLL_ACQUIRING_VOUCHER_{ddmmyy}_N{RUN_NUMBER}.xlsx"
+
+    # If mismatch -> write error file and stop (user requested this behavior)
+    if voucher_debit_total != voucher_credit_total:
+        errfile = out_folder / f"ERROR_ETOLL_ACQUIRING_VOUCHER_{ddmmyy}_N{RUN_NUMBER}.xlsx"
+        with pd.ExcelWriter(errfile, engine="openpyxl") as ew:
+            voucher_df.to_excel(ew, sheet_name="Voucher", index=False)
+            upload_df.to_excel(ew, sheet_name="Upload", index=False)
+        print("ERROR: Debit and credit not tallied. Written error file:", errfile.resolve())
+        # STOP processing as per requirement
+        return
+
+    # Save voucher and upload into same workbook (Voucher sheet + Upload sheet)
+    with pd.ExcelWriter(outfile, engine="openpyxl") as ew:
+        voucher_df.to_excel(ew, sheet_name="Voucher", index=False)
+        upload_df.to_excel(ew, sheet_name="Upload", index=False)
+
+    print("Voucher + Upload saved at:", outfile.resolve())
 
 
 if __name__ == "__main__":
